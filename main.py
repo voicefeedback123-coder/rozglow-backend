@@ -1,10 +1,10 @@
 import os
 import re
 import json
+import subprocess
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
 from openai import OpenAI
 
 app = FastAPI(title="RozGlow API", version="1.0.0")
@@ -49,26 +49,110 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Could not extract video ID from URL")
 
 def get_transcript(video_id: str) -> str:
-    ytt_api = YouTubeTranscriptApi()
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    
+    # Method 1: Try youtube-transcript-api first
     try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        ytt_api = YouTubeTranscriptApi()
         transcript = ytt_api.fetch(video_id, languages=['hi', 'en', 'hi-IN', 'en-IN'])
         full_text = " ".join([snippet.text for snippet in transcript])
+        if len(full_text.strip()) > 50:
+            if len(full_text) > 12000:
+                full_text = full_text[:12000] + "..."
+            return full_text
     except Exception:
-        try:
-            transcript_list = ytt_api.list(video_id)
-            available = list(transcript_list)
-            if not available:
-                raise HTTPException(status_code=400, detail="No subtitles available for this video")
-            transcript = available[0].fetch()
-            full_text = " ".join([snippet.text for snippet in transcript])
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not fetch transcript: {str(e)}")
-
-    if len(full_text) > 12000:
-        full_text = full_text[:12000] + "..."
-    return full_text
+        pass
+    
+    # Method 2: Try yt-dlp to extract subtitles
+    try:
+        # First get available subs
+        result = subprocess.run(
+            ["yt-dlp", "--skip-download", "--write-auto-sub", "--sub-lang", "hi,en,hi-IN,en-IN",
+             "--sub-format", "json3", "--write-sub", "-o", "/tmp/%(id)s", url],
+            capture_output=True, text=True, timeout=30
+        )
+        
+        # Try to find and read the subtitle file
+        import glob
+        sub_files = glob.glob(f"/tmp/{video_id}*.json3") + glob.glob(f"/tmp/{video_id}*.vtt") + glob.glob(f"/tmp/{video_id}*.srv*")
+        
+        if sub_files:
+            with open(sub_files[0], 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Parse json3 format
+            if sub_files[0].endswith('.json3'):
+                data = json.loads(content)
+                events = data.get('events', [])
+                texts = []
+                for event in events:
+                    segs = event.get('segs', [])
+                    for seg in segs:
+                        text = seg.get('utf8', '').strip()
+                        if text and text != '\n':
+                            texts.append(text)
+                full_text = " ".join(texts)
+            else:
+                # VTT/SRV format - strip tags and timestamps
+                lines = content.split('\n')
+                texts = []
+                for line in lines:
+                    line = line.strip()
+                    if not line or '-->' in line or line.isdigit() or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:'):
+                        continue
+                    clean = re.sub(r'<[^>]+>', '', line)
+                    if clean.strip():
+                        texts.append(clean.strip())
+                full_text = " ".join(texts)
+            
+            # Cleanup
+            for f in sub_files:
+                os.remove(f)
+            
+            if len(full_text.strip()) > 50:
+                if len(full_text) > 12000:
+                    full_text = full_text[:12000] + "..."
+                return full_text
+    except Exception:
+        pass
+    
+    # Method 3: Use yt-dlp to get auto-generated subtitles differently
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--skip-download", "--write-auto-sub", "--sub-lang", "hi,en",
+             "--convert-subs", "vtt", "-o", "/tmp/sub_%(id)s", url],
+            capture_output=True, text=True, timeout=30
+        )
+        
+        import glob
+        sub_files = glob.glob(f"/tmp/sub_{video_id}*")
+        
+        if sub_files:
+            with open(sub_files[0], 'r', encoding='utf-8') as f:
+                content = f.read()
+            lines = content.split('\n')
+            texts = []
+            for line in lines:
+                line = line.strip()
+                if not line or '-->' in line or line.isdigit() or line.startswith('WEBVTT') or line.startswith('Kind:') or line.startswith('Language:'):
+                    continue
+                clean = re.sub(r'<[^>]+>', '', line)
+                if clean.strip():
+                    texts.append(clean.strip())
+            full_text = " ".join(texts)
+            
+            for f in sub_files:
+                os.remove(f)
+            
+            if len(full_text.strip()) > 50:
+                if len(full_text) > 12000:
+                    full_text = full_text[:12000] + "..."
+                return full_text
+    except Exception:
+        pass
+    
+    raise HTTPException(status_code=400, detail="Could not fetch transcript. Make sure the video has subtitles/captions enabled.")
 
 SYSTEM_PROMPT = """You are a skincare remedy extraction AI for the RozGlow app.
 Your job is to analyze YouTube video transcripts (often in Hindi/Hinglish/English) and extract structured home remedy information.
